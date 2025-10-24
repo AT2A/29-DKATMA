@@ -61,7 +61,8 @@ def run_ercot_price_sim(
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / "ERCOT_Busbar_Simulation_single.csv"
         proj.to_csv(out_path, index=False)
-        print(f"✅ Saved single Busbar simulation to {out_path.resolve()}")
+        print(f"Saved single Busbar simulation to {out_path.resolve()}")
+        
 
     return proj
 

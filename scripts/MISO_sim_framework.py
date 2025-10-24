@@ -135,7 +135,7 @@ def run_miso_gen_sim(
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / f"MISO_Gen_Simulation_{start_year}_{end_year}.csv"
         sim.to_csv(out_path, index_label="Datetime")
-        print(f"✅ Saved single Gen simulation to {out_path.resolve()}")
+        print(f"Saved single Gen simulation to {out_path.resolve()}")
 
     return sim
 
@@ -143,4 +143,4 @@ def run_miso_gen_sim(
 if __name__ == "__main__":
     price_df = run_miso_price_sim(save=False)
     gen_df   = run_miso_gen_sim(save=False)
-    print("\n✅ Finished one MISO price & generation simulation run.")
+    print("\nFinished one MISO price & generation simulation run.")

@@ -1,0 +1,42 @@
+{
+  "term_years": [
+    2026,
+    2027,
+    2028,
+    2029,
+    2030
+  ],
+  "p_level": 75,
+  "expected_generation_csv": "C:\\Coding\\29-DKATMA\\data\\results\\MISO\\2025-10-24_16-11-38\\expected_generation_2026-2030.csv",
+  "fixed_prices_csv": "C:\\Coding\\29-DKATMA\\data\\results\\MISO\\2025-10-24_16-11-38\\fixed_prices.csv",
+  "fixed_prices": [
+    {
+      "Product": "RT Hub",
+      "Hub_Component": 52.46745762711864,
+      "Basis_Component": 0.0,
+      "Risk_Adjustment": -7.105427357601002e-15,
+      "Fixed_Price_$/MWh": 52.31074042952848
+    },
+    {
+      "Product": "DA Hub",
+      "Hub_Component": 52.46745762711864,
+      "Basis_Component": 0.0,
+      "Risk_Adjustment": -7.105427357601002e-15,
+      "Fixed_Price_$/MWh": 52.31074042952848
+    },
+    {
+      "Product": "RT Busbar",
+      "Hub_Component": 52.46745762711864,
+      "Basis_Component": -12.482935188677471,
+      "Risk_Adjustment": 1.323716693878616,
+      "Fixed_Price_$/MWh": 41.10451886602375
+    },
+    {
+      "Product": "DA Busbar",
+      "Hub_Component": 52.46745762711864,
+      "Basis_Component": -12.577704120325793,
+      "Risk_Adjustment": 1.4607053228713056,
+      "Fixed_Price_$/MWh": 41.133653194315734
+    }
+  ]
+}
