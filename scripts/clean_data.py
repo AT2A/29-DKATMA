@@ -163,36 +163,90 @@ def load_and_clean_sheet(
     logger.info(f"{sheet_name}: cleaned {len(df)} rows; columns: {list(df.columns)}")
     return df
 
+def load_monthly_forwards(file_path: Path, sheet_name: str) -> pd.DataFrame:
+    """
+    Extract monthly forward prices (projected Peak/OffPeak) from columns K–M (rows 11–70).
+    Expected columns:
+        K -> Month (e.g., 'Jan-26')
+        L -> Forward_Peak
+        M -> Forward_OffPeak
+    """
+    logger.info(f"Loading monthly forwards from {sheet_name}...")
+
+    # Read just the range (usecols limits columns, skip rows before 10)
+    df = pd.read_excel(
+        file_path,
+        sheet_name=sheet_name,
+        usecols="K:M",
+        skiprows=10,  # zero-based index, skips top 10 rows (so row 11 = index 10)
+        nrows=60,     # expected number of months
+        names=["Month", "Forward_Peak", "Forward_OffPeak"],
+    )
+
+    # Drop rows without a valid month label
+    df = df.dropna(subset=["Month"])
+
+    # Convert Month like "Jan-26" -> datetime (first day of month)
+    df["Month"] = pd.to_datetime(df["Month"], format="%b-%y", errors="coerce")
+
+    # Drop rows that couldn’t parse
+    df = df.dropna(subset=["Month"])
+
+    # Coerce prices to numeric
+    df["Forward_Peak"] = pd.to_numeric(df["Forward_Peak"], errors="coerce")
+    df["Forward_OffPeak"] = pd.to_numeric(df["Forward_OffPeak"], errors="coerce")
+
+    # Set Datetime index
+    df = df.set_index("Month").sort_index()
+
+    logger.info(f"{sheet_name} monthly forwards: {len(df)} months loaded.")
+    return df
+
 def load_and_clean_data(
     file_path: str | Path,
     sheet_names: Iterable[str] = ("ERCOT", "MISO", "CAISO"),
     numeric_cols: Optional[Iterable[str]] = None,
     align: str = "start",
     require_price_any: bool = False,
-) -> Dict[str, pd.DataFrame]:
-    """Load and clean all sheets into a dict."""
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Load and clean both hourly and monthly forward data for each sheet.
+    Returns nested dict:
+      data[ISO]["hourly"]
+      data[ISO]["forwards"]
+    """
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    cleaned: Dict[str, pd.DataFrame] = {}
+    cleaned: Dict[str, Dict[str, pd.DataFrame]] = {}
     for sheet in sheet_names:
-        cleaned[sheet] = load_and_clean_sheet(
+        hourly_df = load_and_clean_sheet(
             path, sheet,
             numeric_cols=numeric_cols,
             align=align,
             require_price_any=require_price_any,
         )
+        monthly_df = load_monthly_forwards(path, sheet)
+        cleaned[sheet] = {
+            "hourly": hourly_df,
+            "forwards": monthly_df,
+        }
     return cleaned
 
-def save_cleaned_data(data: Dict[str, pd.DataFrame], output_dir: str | Path = "data/cleaned") -> None:
-    """Save each cleaned sheet to CSV (index included)."""
+def save_cleaned_data(data: Dict[str, Dict[str, pd.DataFrame]], output_dir: str | Path = "data/cleaned") -> None:
+    """Save hourly and monthly cleaned data for each ISO."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name, df in data.items():
-        path = out / f"{name}_cleaned.csv"
-        df.to_csv(path)
-        logger.info(f"Saved: {path.resolve()}")
+
+    for name, parts in data.items():
+        hourly_path = out / f"{name}_cleaned.csv"
+        parts["hourly"].to_csv(hourly_path)
+        logger.info(f"Saved hourly data: {hourly_path.resolve()}")
+
+        monthly_path = out / f"{name}_forwards.csv"
+        parts["forwards"].to_csv(monthly_path)
+        logger.info(f"Saved monthly forwards: {monthly_path.resolve()}")
 
 # -----------------------------
 # CLI
