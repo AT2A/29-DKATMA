@@ -1,10 +1,12 @@
+# scripts/Monte_Carlo_sim.py
 from __future__ import annotations
 import sys
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Tuple
-from time import perf_counter
+from typing import Tuple, Dict, Any, Literal
+from time import perf_counter, strftime
 
 # ============================================
 # Framework Imports
@@ -13,18 +15,26 @@ from scripts.MISO_sim_framework import run_miso_gen_sim
 from scripts.ERCOT_sim_framework import run_ercot_gen_sim
 from scripts.CAISO_sim_framework import run_caiso_gen_sim
 
-
 # ============================================
-# Helpers
+# Helpers: paths, time fmt
 # ============================================
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
+def fmt_secs(s: float) -> str:
+    """Pretty print seconds as H:MM:SS.mmm."""
+    h = int(s // 3600)
+    s -= h * 3600
+    m = int(s // 60)
+    s -= m * 60
+    return f"{h:d}:{m:02d}:{s:06.3f}"
 
+# ============================================
+# Data helpers (monthly indices, gen aggregation)
+# ============================================
 def month_start_index(dt_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Normalize timestamps to the first day of their month (00:00)."""
     return pd.to_datetime([pd.Timestamp(y, m, 1) for y, m in zip(dt_index.year, dt_index.month)])
-
 
 def compute_monthly_gen_mwh(gen_series: pd.Series) -> pd.DataFrame:
     """Sum hourly Gen to monthly MWh. Returns a DataFrame indexed by MonthStart."""
@@ -32,7 +42,6 @@ def compute_monthly_gen_mwh(gen_series: pd.Series) -> pd.DataFrame:
     gen_series.index = month_start_index(gen_series.index)
     monthly = gen_series.groupby(gen_series.index).sum()
     return pd.DataFrame({"Gen_MWh": monthly})
-
 
 def precompute_price_inputs(cleaned_dir: Path, company: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Load spread stats and forward curve for MISO, ERCOT, or CAISO."""
@@ -83,15 +92,16 @@ def precompute_price_inputs(cleaned_dir: Path, company: str) -> Tuple[pd.DataFra
     fwd["MonthNum"] = fwd["MonthStart"].dt.month
     return spread_stats, fwd
 
-
+# ============================================
+# Price simulation (vectorized)
+# ============================================
 def simulate_busbar_matrix(spread_stats: pd.DataFrame, fwd: pd.DataFrame, n_sims: int) -> pd.DataFrame:
     """
-    Vectorized price simulation:
-      For each forward month j, Busbar[:, j] = Forward_Peak_j + N(Spread_Mean_m, Spread_Std_m)
-      where m = calendar month number of that j.
+    For each forward month j, Busbar[:, j] = Forward_Peak_j + N(Spread_Mean_m, Spread_Std_m)
+    where m = calendar month number of that j.
     Returns a DataFrame with index MonthStart and columns Sim1..SimN.
     """
-    rng = np.random.default_rng()
+    rng = np.random.default_rng()  # no fixed seed -> different each run
     fwd = fwd.merge(spread_stats, on="MonthNum", how="left")
     mu = (fwd["Forward_Peak"] + fwd["Spread_Mean"]).to_numpy(dtype=float)
     sig = fwd["Spread_Std"].to_numpy(dtype=float)
@@ -102,26 +112,132 @@ def simulate_busbar_matrix(spread_stats: pd.DataFrame, fwd: pd.DataFrame, n_sims
     cols = [f"Sim{i+1}" for i in range(n_sims)]
     return pd.DataFrame(busbar, index=fwd["MonthStart"], columns=cols)
 
+# ============================================
+# Peak/off-peak utilities (7x16 default)
+# ============================================
+def is_peak_hour(ts: pd.Timestamp) -> bool:
+    # 7x16: Weekdays Mon-Fri, hours 7..22 inclusive (start of hour)
+    return (ts.weekday() < 5) and (7 <= ts.hour <= 22)
 
-def fmt_secs(s: float) -> str:
-    """Pretty print seconds as H:MM:SS.mmm."""
-    h = int(s // 3600)
-    s -= h * 3600
-    m = int(s // 60)
-    s -= m * 60
-    return f"{h:d}:{m:02d}:{s:06.3f}"
+def month_key(ts: pd.Timestamp) -> pd.Timestamp:
+    return pd.Timestamp(ts.year, ts.month, 1)
 
+def split_peak_offpeak_monthly(gen_hourly: pd.Series) -> pd.DataFrame:
+    """Return DataFrame indexed by MonthStart with columns Peak_MWh, Offpeak_MWh."""
+    df = gen_hourly.to_frame("Gen")
+    df["MonthStart"] = df.index.map(month_key)
+    df["IsPeak"] = df.index.map(is_peak_hour)
+    monthly = (
+        df.groupby(["MonthStart", "IsPeak"])["Gen"].sum()
+          .unstack(fill_value=0.0)
+          .rename(columns={True: "Peak_MWh", False: "Offpeak_MWh"})
+    )
+    for col in ["Peak_MWh", "Offpeak_MWh"]:
+        if col not in monthly.columns:
+            monthly[col] = 0.0
+    return monthly[["Peak_MWh", "Offpeak_MWh"]]
+
+def filter_term_months(idx: pd.Series | pd.DatetimeIndex, start_year=2026, end_year=2030) -> pd.DatetimeIndex:
+    months = pd.to_datetime(pd.Series(idx).dt.to_period("M").dt.start_time)
+    mask = (months.dt.year >= start_year) & (months.dt.year <= end_year)
+    return pd.DatetimeIndex(sorted(months[mask].unique()))
 
 # ============================================
-# Main Monte Carlo Runner
+# Price assembly for valuation (hub, basis, DA/RT)
 # ============================================
-def run_revenue_simulation(
-    company: str, n_sims: int, reuse_gen: bool = False, seed: int = 42, timings: bool = False
-):
+def compute_monthly_price_components(spread_stats: pd.DataFrame, fwd: pd.DataFrame, n_sims: int):
     """
-    Monte Carlo revenue simulation for MISO, ERCOT, and CAISO.
-    Default: reuse_gen=False → new Gen simulation per run (full Monte Carlo).
+    Returns dict with simulated monthly prices (months × sims) for:
+      RT_Hub, DA_Hub, RT_Busbar, DA_Busbar
+    Strategy:
+      - Treat Forward_Peak as hub forward if dedicated hub columns absent.
+      - Simulate RT and DA spreads with AvgSpread stats (unless DA/RT-specific stats added upstream).
+      - If fwd has Forward_Offpeak, it's included for off-peak weighting of hub.
     """
+    fwd = fwd.copy()
+    fwd["MonthStart"] = pd.to_datetime(fwd["Month"].dt.to_period("M").dt.start_time)
+    fwd["MonthNum"] = fwd["MonthStart"].dt.month
+
+    fwd = fwd.merge(
+        spread_stats.rename(columns={"Spread_Mean": "AvgSpread_Mean", "Spread_Std": "AvgSpread_Std"}),
+        on="MonthNum",
+        how="left",
+    )
+
+    rng = np.random.default_rng()
+
+    # Hub forwards (peak)
+    if "Forward_Hub_Peak" in fwd.columns:
+        hub_peak = fwd["Forward_Hub_Peak"].to_numpy(float)
+    else:
+        hub_peak = fwd["Forward_Peak"].to_numpy(float)
+
+    # Off-peak hub forward if available
+    hub_off = fwd["Forward_Offpeak"].to_numpy(float) if "Forward_Offpeak" in fwd.columns else None
+
+    # DA uplift (if included in fwd); else 0
+    hub_da_uplift = fwd.get("DA_Hub_Uplift_Mean", pd.Series(0.0, index=fwd.index)).to_numpy(float) \
+        if "DA_Hub_Uplift_Mean" in fwd.columns else np.zeros(len(fwd), dtype=float)
+
+    # Spread stats (fallback to AvgSpread for both RT/DA)
+    rt_spread_mu = fwd.get("RT_Spread_Mean", fwd["AvgSpread_Mean"]).to_numpy(float)
+    rt_spread_sd = fwd.get("RT_Spread_Std",  fwd["AvgSpread_Std"]).to_numpy(float)
+    da_spread_mu = fwd.get("DA_Spread_Mean", fwd["AvgSpread_Mean"]).to_numpy(float)
+    da_spread_sd = fwd.get("DA_Spread_Std",  fwd["AvgSpread_Std"]).to_numpy(float)
+
+    M = len(fwd)
+    # simulate spreads: (months × sims)
+    rt_spread = rt_spread_mu[:, None] + rng.normal(0.0, rt_spread_sd[:, None], size=(M, n_sims))
+    da_spread = da_spread_mu[:, None] + rng.normal(0.0, da_spread_sd[:, None], size=(M, n_sims))
+
+    # hub price paths (peak forward baseline + optional DA uplift)
+    rt_hub = np.repeat(hub_peak[:, None], n_sims, axis=1)  # (M×S)
+    da_hub = rt_hub + hub_da_uplift[:, None]
+
+    # busbar = hub + spread
+    rt_busbar = rt_hub + rt_spread
+    da_busbar = da_hub + da_spread
+
+    out = {
+        "RT_Hub": (fwd["MonthStart"], rt_hub),
+        "DA_Hub": (fwd["MonthStart"], da_hub),
+        "RT_Busbar": (fwd["MonthStart"], rt_busbar),
+        "DA_Busbar": (fwd["MonthStart"], da_busbar),
+    }
+    if hub_off is not None:
+        out["Hub_Offpeak_Forward"] = (fwd["MonthStart"], np.repeat(hub_off[:, None], n_sims, axis=1))
+    return out
+
+def weighted_term_revenue(gen_monthly_peak: np.ndarray, gen_monthly_off: np.ndarray,
+                          px_peak: np.ndarray, px_off: np.ndarray | None) -> np.ndarray:
+    """
+    Revenue per sim over the whole term using monthly peak/off-peak MWh and prices:
+      revenue = sum_m (gen_peak[m] * px_peak[m, sim] + gen_off[m] * px_off[m, sim or fallback])
+    If px_off is None, fall back to px_peak for both (conservative).
+    """
+    if px_off is None:
+        return (gen_monthly_peak[:, None] * px_peak +
+                gen_monthly_off[:, None] * px_peak).sum(axis=0)
+    else:
+        return (gen_monthly_peak[:, None] * px_peak +
+                gen_monthly_off[:, None] * px_off).sum(axis=0)
+
+# ============================================
+# Valuation model (P75 fixed; deliverables only; per-sim timings printed)
+# ============================================
+def run_valuation_model(company: str, n_sims: int = 200, reuse_gen: bool = False) -> Dict[str, Any]:
+    """
+    Always builds the deliverables for 2026–2030 (P75 fixed price) and prints per-sim timings:
+      1) Expected generation by month (Peak/Off-peak)
+      2) Four fixed prices (RT/DA × Hub/Busbar) with components: Hub, Basis, Risk_Adjustment
+         (Risk_Adjustment = P75 price − mean price)
+    Saves only:
+      - expected_generation_2026-2030.csv
+      - fixed_prices.csv
+      - valuation.json
+    """
+    P_LEVEL = 75  # fixed P75 as requested
+
     company = company.upper()
     if company not in {"MISO", "ERCOT", "CAISO"}:
         raise NotImplementedError(f"Company '{company}' not supported. Use MISO, ERCOT, or CAISO.")
@@ -129,133 +245,187 @@ def run_revenue_simulation(
     ROOT = project_root()
     CLEANED_DIR = ROOT / "data" / "cleaned"
 
-    print(f"\n🚀 Running {n_sims} Monte Carlo revenue simulations for {company} (reuse_gen={reuse_gen})\n")
+    # results dir
+    timestamp = strftime("%Y-%m-%d_%H-%M-%S")
+    RESULTS_DIR = ROOT / "data" / "results" / company / timestamp
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    t0 = perf_counter()
-
-    # 1) Price inputs
-    t_price0 = perf_counter()
+    # load inputs
     spread_stats, fwd = precompute_price_inputs(CLEANED_DIR, company)
-    t_price1 = perf_counter()
 
-    # 2) Historical generation (in memory)
-    t_gen0 = perf_counter()
+    # restrict to 2026–2030 months present in forwards
+    term_months = filter_term_months(fwd["Month"])
+    if term_months.empty:
+        raise ValueError("No forward months found in 2026–2030 for valuation.")
+
+    fwd_term = fwd[fwd["Month"].isin(term_months)].copy()
+    # simulate monthly price components
+    px = compute_monthly_price_components(spread_stats, fwd_term, n_sims)
+    months_index_all = px["RT_Hub"][0]
+    months_index = pd.DatetimeIndex(sorted(set(months_index_all).intersection(set(term_months))))
+
+    # ---- generation sims (hourly -> monthly peak/off-peak) with per-sim timings ----
     gen_clean_path = CLEANED_DIR / f"{company}_cleaned.csv"
     base_hist_df = pd.read_csv(gen_clean_path, parse_dates=["Datetime"])
     base_hist_series = pd.Series(pd.to_numeric(base_hist_df["Gen"], errors="coerce").values,
                                  index=base_hist_df["Datetime"]).dropna()
 
-    # optional: prebuild generation path if reuse_gen=True
+    peak_cols, off_cols = [], []
+
     if reuse_gen:
+        # build once, but still loop to time the per-sim revenue step uniformly
         if company == "MISO":
-            gen_series = run_miso_gen_sim(hist_series=base_hist_series, save=False)
+            g_series = run_miso_gen_sim(hist_series=base_hist_series, save=False)
         elif company == "ERCOT":
-            gen_series = run_ercot_gen_sim(hist_series=base_hist_series, save=False)
-        elif company == "CAISO":
-            gen_series = run_caiso_gen_sim(hist_series=base_hist_series, save=False)
-        monthly_gen = compute_monthly_gen_mwh(gen_series)
-    else:
-        monthly_gen = None
-    t_gen1 = perf_counter()
-
-    # 3) Vectorized busbar simulation
-    t_vec0 = perf_counter()
-    busbar_mat = simulate_busbar_matrix(spread_stats, fwd, n_sims=n_sims)
-    if reuse_gen:
-        monthly_gen = monthly_gen.reindex(busbar_mat.index).ffill().fillna(0.0)
-    t_vec1 = perf_counter()
-
-    # 4) Monte Carlo revenue loop
-    revenues = []
-    total_gen_each_sim = []
-    per_sim_times = []
-
-    for i in range(n_sims):
-        ts0 = perf_counter()
-
-        # Generation
-        if reuse_gen:
-            gen_mwh = monthly_gen["Gen_MWh"].to_numpy(dtype=float)
+            g_series = run_ercot_gen_sim(hist_series=base_hist_series, save=False)
         else:
+            g_series = run_caiso_gen_sim(hist_series=base_hist_series, save=False)
+        split_once = split_peak_offpeak_monthly(g_series).reindex(months_index).ffill().fillna(0.0)
+        gp = split_once["Peak_MWh"].to_numpy(float)
+        go = split_once["Offpeak_MWh"].to_numpy(float)
+
+        for i in range(n_sims):
+            ts0 = perf_counter()
+            peak_cols.append(gp)
+            off_cols.append(go)
+            # do a trivial operation so timing isn't zero when reusing
+            _ = float(gp.sum() + go.sum())
+            sim_elapsed = perf_counter() - ts0
+            print(f"sim {i+1}/{n_sims} completed in {fmt_secs(sim_elapsed)}")
+    else:
+        for i in range(n_sims):
+            ts0 = perf_counter()
             if company == "MISO":
-                gen_series_i = run_miso_gen_sim(hist_series=base_hist_series, seed=seed + i, save=False)
+                gen_series_i = run_miso_gen_sim(hist_series=base_hist_series, save=False)
             elif company == "ERCOT":
-                gen_series_i = run_ercot_gen_sim(hist_series=base_hist_series, seed=seed + i, save=False)
-            elif company == "CAISO":
-                gen_series_i = run_caiso_gen_sim(hist_series=base_hist_series, seed=seed + i, save=False)
+                gen_series_i = run_ercot_gen_sim(hist_series=base_hist_series, save=False)
+            else:
+                gen_series_i = run_caiso_gen_sim(hist_series=base_hist_series, save=False)
+            monthly_split = split_peak_offpeak_monthly(gen_series_i).reindex(months_index).ffill().fillna(0.0)
+            peak_cols.append(monthly_split["Peak_MWh"].to_numpy(float))
+            off_cols.append(monthly_split["Offpeak_MWh"].to_numpy(float))
+            sim_elapsed = perf_counter() - ts0
+            print(f"sim {i+1}/{n_sims} completed in {fmt_secs(sim_elapsed)}")
 
-            mgen_i = compute_monthly_gen_mwh(gen_series_i).reindex(busbar_mat.index).ffill().fillna(0.0)
-            gen_mwh = mgen_i["Gen_MWh"].to_numpy(dtype=float)
+    gen_peak_mat = np.column_stack(peak_cols)  # (M×S)
+    gen_off_mat  = np.column_stack(off_cols)   # (M×S)
 
-        total_gen_each_sim.append(float(np.sum(gen_mwh)))
-
-        # Prices & Revenue
-        prices_i = busbar_mat.iloc[:, i].to_numpy(dtype=float)
-        revenues.append(float(np.dot(gen_mwh, prices_i)))
-
-        ts1 = perf_counter()
-        per_sim_times.append(ts1 - ts0)
-        if timings:
-            print(f"sim {i+1}/{n_sims} completed in {fmt_secs(ts1 - ts0)}")
-
-    # 5) Summaries
-    t1 = perf_counter()
-    total_time = t1 - t0
-    avg_time_per_sim = sum(per_sim_times) / n_sims if n_sims > 0 else 0.0
-
-    revenues = np.array(revenues, dtype=float)
-    mean_rev, std_rev = revenues.mean(), revenues.std()
-    p75_rev = np.percentile(revenues, 75)
-
-    total_gen_each_sim = np.array(total_gen_each_sim, dtype=float)
-    denom_mwh = (
-        float(total_gen_each_sim[0])
-        if reuse_gen and len(total_gen_each_sim) > 0
-        else float(total_gen_each_sim.mean()) if len(total_gen_each_sim) > 0 else np.nan
+    # expected generation per month (mean across sims)
+    exp_gen_peak = gen_peak_mat.mean(axis=1)
+    exp_gen_off  = gen_off_mat.mean(axis=1)
+    expected_generation = pd.DataFrame(
+        {"Peak_MWh": exp_gen_peak, "Offpeak_MWh": exp_gen_off}, index=months_index
     )
+    expected_generation.index.name = "MonthStart"
+    expected_generation.to_csv(RESULTS_DIR / "expected_generation_2026-2030.csv")
 
-    fixed_price_mean = mean_rev / denom_mwh if denom_mwh and denom_mwh > 0 else np.nan
-    fixed_price_p75 = p75_rev / denom_mwh if denom_mwh and denom_mwh > 0 else np.nan
+    # ---- term revenues per product; P75 fixed price ----
+    # align matrices to months_index
+    sel_rt_hub = np.isin(px["RT_Hub"][0], months_index)
+    sel_da_hub = np.isin(px["DA_Hub"][0], months_index)
+    sel_rt_bus = np.isin(px["RT_Busbar"][0], months_index)
+    sel_da_bus = np.isin(px["DA_Busbar"][0], months_index)
 
-    print("\nrevenue distribution summary")
-    print(f"mean: ${mean_rev:,.2f}")
-    print(f"std dev: ${std_rev:,.2f}")
-    print(f"75th percentile: ${p75_rev:,.2f}")
+    rt_hub = px["RT_Hub"][1][sel_rt_hub]
+    da_hub = px["DA_Hub"][1][sel_da_hub]
+    rt_bus = px["RT_Busbar"][1][sel_rt_bus]
+    da_bus = px["DA_Busbar"][1][sel_da_bus]
 
-    print("\nfixed price (using avg total MWh denominator)")
-    if not np.isnan(fixed_price_mean):
-        print(f"at mean revenue: ${fixed_price_mean:,.2f}/MWh")
-    if not np.isnan(fixed_price_p75):
-        print(f"at 75th pct rev: ${fixed_price_p75:,.2f}/MWh")
+    hub_off = px.get("Hub_Offpeak_Forward", None)
+    hub_off_mat = hub_off[1][np.isin(hub_off[0], months_index)] if hub_off is not None else None
 
-    print(f"\n⏱️ timing")
-    print(f"price prep:     {fmt_secs(t_price1 - t_price0)}")
-    print(f"gen prep:       {fmt_secs(t_gen1 - t_gen0)}")
-    print(f"vectorized px:  {fmt_secs(t_vec1 - t_vec0)}")
-    print(f"per-sim (avg):  {fmt_secs(avg_time_per_sim)}")
-    print(f"total runtime:  {fmt_secs(total_time)}\n")
+    def term_rev(gen_peak_vec: np.ndarray, gen_off_vec: np.ndarray,
+                 prod_mat_peak: np.ndarray, prod_mat_off: np.ndarray | None) -> np.ndarray:
+        """Revenue across sims for a single sim's gen vectors vs price matrices."""
+        if prod_mat_off is None:
+            return (gen_peak_vec[:, None] * prod_mat_peak +
+                    gen_off_vec[:, None] * prod_mat_peak).sum(axis=0)
+        else:
+            return (gen_peak_vec[:, None] * prod_mat_peak +
+                    gen_off_vec[:, None] * prod_mat_off).sum(axis=0)
 
-    return revenues, p75_rev
+    # compute portfolio (term) revenues for each gen sim vs all price sims, then reduce on price axis
+    # To stay simple and light, we use expected gen (mean) for fixed-price denominator.
+    total_mwh_term = float((exp_gen_peak + exp_gen_off).sum())
 
+    # Use expected gen vectors for price evaluation (aligns with deliverable "expected generation")
+    rev_rt_hub = term_rev(exp_gen_peak, exp_gen_off, rt_hub, hub_off_mat)
+    rev_da_hub = term_rev(exp_gen_peak, exp_gen_off, da_hub, hub_off_mat)
+    rev_rt_bus = term_rev(exp_gen_peak, exp_gen_off, rt_bus, hub_off_mat)
+    rev_da_bus = term_rev(exp_gen_peak, exp_gen_off, da_bus, hub_off_mat)
+
+    def fixed_price_from_revenues(rev: np.ndarray) -> Dict[str, float]:
+        pctl = float(np.percentile(rev, P_LEVEL))
+        mean = float(rev.mean())
+        px_mean = mean / total_mwh_term if total_mwh_term > 0 else np.nan
+        px_p    = pctl / total_mwh_term if total_mwh_term > 0 else np.nan
+        risk_adj = px_p - px_mean
+        return {"fixed_price": px_p, "mean_price": px_mean, "risk_adjustment": risk_adj}
+
+    # basis components (mean monthly basis over term) & hub components
+    basis_rt = float((rt_bus.mean(axis=1) - rt_hub.mean(axis=1)).mean())
+    basis_da = float((da_bus.mean(axis=1) - da_hub.mean(axis=1)).mean())
+    hub_component = {
+        "RT": float(rt_hub.mean(axis=1).mean()),
+        "DA": float(da_hub.mean(axis=1).mean()),
+    }
+
+    pr_rt_hub = fixed_price_from_revenues(rev_rt_hub)
+    pr_da_hub = fixed_price_from_revenues(rev_da_hub)
+    pr_rt_bus = fixed_price_from_revenues(rev_rt_bus)
+    pr_da_bus = fixed_price_from_revenues(rev_da_bus)
+
+    # build fixed price table with components
+    fixed_rows = []
+    def add_row(name, hub_mean, basis_mean, price_pack):
+        fixed_rows.append({
+            "Product": name,
+            "Hub_Component": hub_mean,
+            "Basis_Component": basis_mean,
+            "Risk_Adjustment": price_pack["risk_adjustment"],
+            "Fixed_Price_$/MWh": price_pack["fixed_price"],
+        })
+
+    add_row("RT Hub",     hub_component["RT"], 0.0,      pr_rt_hub)
+    add_row("DA Hub",     hub_component["DA"], 0.0,      pr_da_hub)
+    add_row("RT Busbar",  hub_component["RT"], basis_rt, pr_rt_bus)
+    add_row("DA Busbar",  hub_component["DA"], basis_da, pr_da_bus)
+
+    fixed_prices_df = pd.DataFrame(fixed_rows, columns=[
+        "Product","Hub_Component","Basis_Component","Risk_Adjustment","Fixed_Price_$/MWh"
+    ])
+    fixed_prices_df.to_csv(RESULTS_DIR / "fixed_prices.csv", index=False)
+
+    # JSON deliverable
+    valuation = {
+        "term_years": [2026, 2027, 2028, 2029, 2030],
+        "p_level": 75,
+        "expected_generation_csv": str((RESULTS_DIR / "expected_generation_2026-2030.csv").resolve()),
+        "fixed_prices_csv": str((RESULTS_DIR / "fixed_prices.csv").resolve()),
+        "fixed_prices": fixed_rows,
+    }
+    with open(RESULTS_DIR / "valuation.json", "w") as f:
+        json.dump(valuation, f, indent=2)
+
+    # Minimal confirmation
+    print("\nValuation artifacts written:")
+    print(" - expected_generation_2026-2030.csv")
+    print(" - fixed_prices.csv")
+    print(" - valuation.json")
+
+    return valuation
 
 # ============================================
-# CLI Entry Point
+# CLI Entry Point (always valuation mode)
 # ============================================
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python -m scripts.Monte_Carlo_sim <company> <n_sims> [--reuse-gen] [--timings]")
-        print("       (default uses a new Gen path for each simulation)")
+        print("Usage:")
+        print("  python -m scripts.Monte_Carlo_sim <company> <n_sims> [--reuse-gen]")
         sys.exit(1)
 
-    company = sys.argv[1]
+    company = sys.argv[1].upper()
     n_sims = int(sys.argv[2])
-    reuse = False
-    timings = False
+    reuse = "--reuse-gen" in sys.argv[3:]
 
-    for arg in sys.argv[3:]:
-        if arg == "--reuse-gen":
-            reuse = True
-        elif arg == "--timings":
-            timings = True
-
-    run_revenue_simulation(company, n_sims, reuse_gen=reuse, seed=42, timings=timings)
+    run_valuation_model(company, n_sims=n_sims, reuse_gen=reuse)
