@@ -6,19 +6,25 @@ from pathlib import Path
 from typing import Tuple
 from time import perf_counter
 
-# Frameworks
+# ============================================
+# Framework Imports
+# ============================================
 from scripts.MISO_sim_framework import run_miso_gen_sim
 from scripts.ERCOT_sim_framework import run_ercot_gen_sim
+from scripts.CAISO_sim_framework import run_caiso_gen_sim
 
-# ----------------------------
+
+# ============================================
 # Helpers
-# ----------------------------
+# ============================================
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
 
 def month_start_index(dt_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Normalize timestamps to the first day of their month (00:00)."""
     return pd.to_datetime([pd.Timestamp(y, m, 1) for y, m in zip(dt_index.year, dt_index.month)])
+
 
 def compute_monthly_gen_mwh(gen_series: pd.Series) -> pd.DataFrame:
     """Sum hourly Gen to monthly MWh. Returns a DataFrame indexed by MonthStart."""
@@ -27,8 +33,9 @@ def compute_monthly_gen_mwh(gen_series: pd.Series) -> pd.DataFrame:
     monthly = gen_series.groupby(gen_series.index).sum()
     return pd.DataFrame({"Gen_MWh": monthly})
 
+
 def precompute_price_inputs(cleaned_dir: Path, company: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load spread stats and forward curve for MISO or ERCOT."""
+    """Load spread stats and forward curve for MISO, ERCOT, or CAISO."""
     cleaned_dir = Path(cleaned_dir)
     mclean = cleaned_dir / f"{company}_cleaned.csv"
     mforwd = cleaned_dir / f"{company}_forwards.csv"
@@ -37,17 +44,24 @@ def precompute_price_inputs(cleaned_dir: Path, company: str) -> Tuple[pd.DataFra
     if not mforwd.exists():
         raise FileNotFoundError(f"Missing file: {mforwd}")
 
-    df  = pd.read_csv(mclean, parse_dates=["Datetime"])
+    df = pd.read_csv(mclean, parse_dates=["Datetime"])
     fwd = pd.read_csv(mforwd, parse_dates=["Month"])
 
     # Spread stats by calendar month (1..12)
     if company == "MISO":
         df["Real_Spread"] = df["Busbar"] - df["Hub"]
-        df["DA_Spread"]   = df["DA Busbar"] - df["DA Hub"]
+        df["DA_Spread"] = df["DA Busbar"] - df["DA Hub"]
     elif company == "ERCOT":
-        # Accept RT columns as fallback
         busbar = df["Busbar"] if "Busbar" in df.columns else df["RT Busbar"]
-        hub    = df["Hub"]    if "Hub"    in df.columns else df["RT Hub"]
+        hub = df["Hub"] if "Hub" in df.columns else df["RT Hub"]
+        df["Real_Spread"] = busbar - hub
+        if {"DA Busbar", "DA Hub"}.issubset(df.columns):
+            df["DA_Spread"] = df["DA Busbar"] - df["DA Hub"]
+        else:
+            df["DA_Spread"] = df["Real_Spread"]
+    elif company == "CAISO":
+        busbar = df["Busbar"] if "Busbar" in df.columns else df.get("RT Busbar", pd.Series(np.nan, index=df.index))
+        hub = df["Hub"] if "Hub" in df.columns else df.get("RT Hub", pd.Series(np.nan, index=df.index))
         df["Real_Spread"] = busbar - hub
         if {"DA Busbar", "DA Hub"}.issubset(df.columns):
             df["DA_Spread"] = df["DA Busbar"] - df["DA Hub"]
@@ -57,18 +71,18 @@ def precompute_price_inputs(cleaned_dir: Path, company: str) -> Tuple[pd.DataFra
         raise NotImplementedError(f"Company '{company}' not supported.")
 
     df["Avg_Spread"] = (df["Real_Spread"] + df["DA_Spread"]) / 2
-    df["MonthNum"]   = df["Datetime"].dt.month
+    df["MonthNum"] = df["Datetime"].dt.month
     spread_stats = (
         df.groupby("MonthNum")["Avg_Spread"]
-          .agg(["mean", "std"])
-          .rename(columns={"mean": "Spread_Mean", "std": "Spread_Std"})
-          .reset_index()
+        .agg(["mean", "std"])
+        .rename(columns={"mean": "Spread_Mean", "std": "Spread_Std"})
+        .reset_index()
     )
 
-    # Forward months as proper month keys
     fwd["MonthStart"] = pd.to_datetime(fwd["Month"].dt.to_period("M").dt.start_time)
-    fwd["MonthNum"]   = fwd["MonthStart"].dt.month
+    fwd["MonthNum"] = fwd["MonthStart"].dt.month
     return spread_stats, fwd
+
 
 def simulate_busbar_matrix(spread_stats: pd.DataFrame, fwd: pd.DataFrame, n_sims: int) -> pd.DataFrame:
     """
@@ -77,95 +91,105 @@ def simulate_busbar_matrix(spread_stats: pd.DataFrame, fwd: pd.DataFrame, n_sims
       where m = calendar month number of that j.
     Returns a DataFrame with index MonthStart and columns Sim1..SimN.
     """
-    rng = np.random.default_rng()  # fresh randomness each run
+    rng = np.random.default_rng()
     fwd = fwd.merge(spread_stats, on="MonthNum", how="left")
-    mu  = (fwd["Forward_Peak"] + fwd["Spread_Mean"]).to_numpy(dtype=float)  # (num_months,)
-    sig = fwd["Spread_Std"].to_numpy(dtype=float)                            # (num_months,)
+    mu = (fwd["Forward_Peak"] + fwd["Spread_Mean"]).to_numpy(dtype=float)
+    sig = fwd["Spread_Std"].to_numpy(dtype=float)
 
-    noise   = rng.normal(loc=0.0, scale=sig[:, None], size=(len(fwd), n_sims))
-    busbar  = mu[:, None] + noise  # (num_months, n_sims)
+    noise = rng.normal(loc=0.0, scale=sig[:, None], size=(len(fwd), n_sims))
+    busbar = mu[:, None] + noise
 
     cols = [f"Sim{i+1}" for i in range(n_sims)]
     return pd.DataFrame(busbar, index=fwd["MonthStart"], columns=cols)
 
+
 def fmt_secs(s: float) -> str:
     """Pretty print seconds as H:MM:SS.mmm."""
-    h = int(s // 3600); s -= h*3600
-    m = int(s // 60);   s -= m*60
+    h = int(s // 3600)
+    s -= h * 3600
+    m = int(s // 60)
+    s -= m * 60
     return f"{h:d}:{m:02d}:{s:06.3f}"
 
-# ----------------------------
+
+# ============================================
 # Main Monte Carlo Runner
-# ----------------------------
-def run_revenue_simulation(company: str, n_sims: int, reuse_gen: bool = False, seed: int = 42, timings: bool = False):
+# ============================================
+def run_revenue_simulation(
+    company: str, n_sims: int, reuse_gen: bool = False, seed: int = 42, timings: bool = False
+):
     """
-    Monte Carlo revenue simulation for MISO/ERCOT.
+    Monte Carlo revenue simulation for MISO, ERCOT, and CAISO.
     Default: reuse_gen=False → new Gen simulation per run (full Monte Carlo).
     """
     company = company.upper()
-    if company not in {"MISO", "ERCOT"}:
-        raise NotImplementedError(f"Company '{company}' not supported. Use MISO or ERCOT.")
+    if company not in {"MISO", "ERCOT", "CAISO"}:
+        raise NotImplementedError(f"Company '{company}' not supported. Use MISO, ERCOT, or CAISO.")
 
-    ROOT        = project_root()
+    ROOT = project_root()
     CLEANED_DIR = ROOT / "data" / "cleaned"
 
     print(f"\n🚀 Running {n_sims} Monte Carlo revenue simulations for {company} (reuse_gen={reuse_gen})\n")
 
     t0 = perf_counter()
 
-    # 1) Price inputs once
+    # 1) Price inputs
     t_price0 = perf_counter()
     spread_stats, fwd = precompute_price_inputs(CLEANED_DIR, company)
     t_price1 = perf_counter()
 
-    # 2) Load historical generation ONCE (in-memory)
-    #    This avoids re-reading CSV on each simulation.
+    # 2) Historical generation (in memory)
     t_gen0 = perf_counter()
     gen_clean_path = CLEANED_DIR / f"{company}_cleaned.csv"
     base_hist_df = pd.read_csv(gen_clean_path, parse_dates=["Datetime"])
     base_hist_series = pd.Series(pd.to_numeric(base_hist_df["Gen"], errors="coerce").values,
                                  index=base_hist_df["Datetime"]).dropna()
-    # If user chose reuse_gen=True, build one synthetic path now
+
+    # optional: prebuild generation path if reuse_gen=True
     if reuse_gen:
         if company == "MISO":
             gen_series = run_miso_gen_sim(hist_series=base_hist_series, save=False)
-        else:
+        elif company == "ERCOT":
             gen_series = run_ercot_gen_sim(hist_series=base_hist_series, save=False)
+        elif company == "CAISO":
+            gen_series = run_caiso_gen_sim(hist_series=base_hist_series, save=False)
         monthly_gen = compute_monthly_gen_mwh(gen_series)
     else:
         monthly_gen = None
     t_gen1 = perf_counter()
 
-    # 3) Vectorized simulate busbar for all months × sims
+    # 3) Vectorized busbar simulation
     t_vec0 = perf_counter()
     busbar_mat = simulate_busbar_matrix(spread_stats, fwd, n_sims=n_sims)
     if reuse_gen:
         monthly_gen = monthly_gen.reindex(busbar_mat.index).ffill().fillna(0.0)
     t_vec1 = perf_counter()
 
-    # 4) Monte Carlo loop: compute revenue for each simulation
+    # 4) Monte Carlo revenue loop
     revenues = []
-    total_gen_each_sim = []  # <-- added initialization
+    total_gen_each_sim = []
     per_sim_times = []
 
     for i in range(n_sims):
         ts0 = perf_counter()
 
-        # --- Generation ---
+        # Generation
         if reuse_gen:
             gen_mwh = monthly_gen["Gen_MWh"].to_numpy(dtype=float)
         else:
-            # New Gen path each sim (in-memory base history)
             if company == "MISO":
                 gen_series_i = run_miso_gen_sim(hist_series=base_hist_series, seed=seed + i, save=False)
-            else:
+            elif company == "ERCOT":
                 gen_series_i = run_ercot_gen_sim(hist_series=base_hist_series, seed=seed + i, save=False)
+            elif company == "CAISO":
+                gen_series_i = run_caiso_gen_sim(hist_series=base_hist_series, seed=seed + i, save=False)
+
             mgen_i = compute_monthly_gen_mwh(gen_series_i).reindex(busbar_mat.index).ffill().fillna(0.0)
             gen_mwh = mgen_i["Gen_MWh"].to_numpy(dtype=float)
 
-        total_gen_each_sim.append(float(np.sum(gen_mwh)))  # <-- record total MWh
+        total_gen_each_sim.append(float(np.sum(gen_mwh)))
 
-        # --- Prices & Revenue ---
+        # Prices & Revenue
         prices_i = busbar_mat.iloc[:, i].to_numpy(dtype=float)
         revenues.append(float(np.dot(gen_mwh, prices_i)))
 
@@ -174,24 +198,24 @@ def run_revenue_simulation(company: str, n_sims: int, reuse_gen: bool = False, s
         if timings:
             print(f"sim {i+1}/{n_sims} completed in {fmt_secs(ts1 - ts0)}")
 
-    # --- summarize once, after loop ---
+    # 5) Summaries
     t1 = perf_counter()
     total_time = t1 - t0
-    avg_time_per_sim = (sum(per_sim_times) / n_sims) if n_sims > 0 else 0.0
+    avg_time_per_sim = sum(per_sim_times) / n_sims if n_sims > 0 else 0.0
 
     revenues = np.array(revenues, dtype=float)
     mean_rev, std_rev = revenues.mean(), revenues.std()
     p75_rev = np.percentile(revenues, 75)
 
-    # Determine denominator for fixed price
     total_gen_each_sim = np.array(total_gen_each_sim, dtype=float)
-    if reuse_gen:
-        denom_mwh = float(total_gen_each_sim[0]) if len(total_gen_each_sim) > 0 else np.nan
-    else:
-        denom_mwh = float(total_gen_each_sim.mean()) if len(total_gen_each_sim) > 0 else np.nan
+    denom_mwh = (
+        float(total_gen_each_sim[0])
+        if reuse_gen and len(total_gen_each_sim) > 0
+        else float(total_gen_each_sim.mean()) if len(total_gen_each_sim) > 0 else np.nan
+    )
 
     fixed_price_mean = mean_rev / denom_mwh if denom_mwh and denom_mwh > 0 else np.nan
-    fixed_price_p75  = p75_rev  / denom_mwh if denom_mwh and denom_mwh > 0 else np.nan
+    fixed_price_p75 = p75_rev / denom_mwh if denom_mwh and denom_mwh > 0 else np.nan
 
     print("\nrevenue distribution summary")
     print(f"mean: ${mean_rev:,.2f}")
@@ -213,11 +237,11 @@ def run_revenue_simulation(company: str, n_sims: int, reuse_gen: bool = False, s
 
     return revenues, p75_rev
 
-# ----------------------------
-# CLI entry point
-# ----------------------------
+
+# ============================================
+# CLI Entry Point
+# ============================================
 if __name__ == "__main__":
-    # Usage: python -m scripts.Monte_Carlo_sim MISO 100 [--reuse-gen] [--timings]
     if len(sys.argv) < 3:
         print("Usage: python -m scripts.Monte_Carlo_sim <company> <n_sims> [--reuse-gen] [--timings]")
         print("       (default uses a new Gen path for each simulation)")
@@ -225,7 +249,7 @@ if __name__ == "__main__":
 
     company = sys.argv[1]
     n_sims = int(sys.argv[2])
-    reuse = False   # default: new Gen each sim
+    reuse = False
     timings = False
 
     for arg in sys.argv[3:]:
