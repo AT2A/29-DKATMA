@@ -1,0 +1,42 @@
+{
+  "term_years": [
+    2026,
+    2027,
+    2028,
+    2029,
+    2030
+  ],
+  "p_level": 75,
+  "expected_generation_csv": "C:\\Users\\dnkaz\\Downloads\\Quant_Projects\\29-DKATMA\\data\\results\\ERCOT\\2025-10-24_16-51-26\\expected_generation_2026-2030.csv",
+  "fixed_prices_csv": "C:\\Users\\dnkaz\\Downloads\\Quant_Projects\\29-DKATMA\\data\\results\\ERCOT\\2025-10-24_16-51-26\\fixed_prices.csv",
+  "fixed_prices": [
+    {
+      "Product": "RT Hub",
+      "Hub_Component": 59.243050847457624,
+      "Basis_Component": 0.0,
+      "Risk_Adjustment": -2.842170943040401e-14,
+      "Fixed_Price_$/MWh": 59.286663114056985
+    },
+    {
+      "Product": "DA Hub",
+      "Hub_Component": 59.243050847457624,
+      "Basis_Component": 0.0,
+      "Risk_Adjustment": -2.842170943040401e-14,
+      "Fixed_Price_$/MWh": 59.286663114056985
+    },
+    {
+      "Product": "RT Busbar",
+      "Hub_Component": 59.243050847457624,
+      "Basis_Component": -10.230557157983238,
+      "Risk_Adjustment": 5.395162400846488,
+      "Fixed_Price_$/MWh": 53.615103676701665
+    },
+    {
+      "Product": "DA Busbar",
+      "Hub_Component": 59.243050847457624,
+      "Basis_Component": -10.45330178785309,
+      "Risk_Adjustment": 5.1981628887600735,
+      "Fixed_Price_$/MWh": 53.18282436461687
+    }
+  ]
+}
